@@ -1,0 +1,929 @@
+'use strict';
+
+const mineflayer = require('mineflayer');
+const { Movements, pathfinder, goals } = require('mineflayer-pathfinder');
+const { GoalBlock, GoalFollow } = goals;
+const config = require('./settings.json');
+const express = require('express');
+const http = require('http');
+const https = require('https');
+const fs = require('fs');
+const path = require('path');
+
+const app = express();
+const PORT = process.env.PORT || 5000;
+
+let botState = {
+  connected: false,
+  lastActivity: Date.now(),
+  reconnectAttempts: 0,
+  startTime: Date.now(),
+  errors: [],
+  wasThrottled: false
+};
+
+const chatLogBuffer = [];
+const CHAT_LOG_MAX = 20;
+
+function appendChatLog(username, message) {
+  const now = new Date();
+  const hh = String(now.getHours()).padStart(2, '0');
+  const mm = String(now.getMinutes()).padStart(2, '0');
+  const ss = String(now.getSeconds()).padStart(2, '0');
+  const timeStr = `${hh}:${mm}:${ss}`;
+  chatLogBuffer.push({ time: timeStr, username, message });
+  if (chatLogBuffer.length > CHAT_LOG_MAX) chatLogBuffer.shift();
+  if (config.utils && config.utils['chat-log']) {
+    const line = `[${timeStr}] <${username}>: ${message}\n`;
+    fs.appendFile(path.join(__dirname, 'chat-log.txt'), line, (err) => {
+      if (err) console.log('[ChatLog] Write error:', err.message);
+    });
+  }
+}
+
+app.get('/', (req, res) => {
+  res.send(`
+    <!DOCTYPE html>
+    <html lang="en">
+      <head>
+        <title>${config.name} Dashboard</title>
+        <meta charset="utf-8">
+        <meta name="viewport" content="width=device-width, initial-scale=1">
+        <style>
+          @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;600;700&display=swap');
+          :root {
+            --bg: #0f172a;
+            --container-bg: #111827;
+            --card-bg: #1f2937;
+            --accent: #2dd4bf;
+            --text-main: #f8fafc;
+            --text-dim: #94a3b8;
+          }
+          body {
+            font-family: 'Inter', sans-serif;
+            background: var(--bg);
+            color: var(--text-main);
+            display: flex;
+            justify-content: center;
+            align-items: flex-start;
+            min-height: 100vh;
+            margin: 0;
+            padding: 2rem 1rem;
+            box-sizing: border-box;
+          }
+          .container {
+            background: var(--container-bg);
+            padding: 2.5rem 2rem;
+            border-radius: 2rem;
+            width: 480px;
+            max-width: 100%;
+            box-shadow: 0 25px 50px -12px rgba(0,0,0,0.5);
+            border: 1px solid #1f2937;
+          }
+          h1 {
+            font-size: 1.875rem;
+            font-weight: 700;
+            margin-bottom: 2rem;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            gap: 0.75rem;
+            color: #f1f5f9;
+            text-align: center;
+          }
+          .card {
+            background: var(--card-bg);
+            border-radius: 1rem;
+            padding: 1.25rem 1.5rem;
+            margin-bottom: 1rem;
+            text-align: left;
+            border-left: 4px solid var(--accent);
+            transition: transform 0.2s;
+          }
+          .card:hover { transform: translateX(4px); }
+          .label {
+            font-size: 0.75rem;
+            font-weight: 600;
+            color: var(--text-dim);
+            text-transform: uppercase;
+            letter-spacing: 0.05em;
+            margin-bottom: 0.5rem;
+          }
+          .value {
+            font-size: 1.2rem;
+            font-weight: 700;
+            color: var(--accent);
+            display: flex;
+            align-items: center;
+            gap: 0.5rem;
+            text-shadow: 0 0 15px rgba(45,212,191,0.3);
+          }
+          .dot {
+            width: 12px; height: 12px;
+            border-radius: 50%;
+            background: #4ade80;
+            box-shadow: 0 0 10px #4ade80;
+            display: inline-block;
+            flex-shrink: 0;
+          }
+          .dot.offline { background: #f87171; box-shadow: 0 0 10px #f87171; }
+          .pulse { animation: pulse-animation 2s infinite; }
+          @keyframes pulse-animation {
+            0%   { transform: scale(0.95); box-shadow: 0 0 0 0 rgba(74,222,128,0.7); }
+            70%  { transform: scale(1);    box-shadow: 0 0 0 10px rgba(74,222,128,0); }
+            100% { transform: scale(0.95); box-shadow: 0 0 0 0 rgba(74,222,128,0); }
+          }
+          .offline.pulse { animation: pulse-offline 2s infinite; }
+          @keyframes pulse-offline {
+            0%   { transform: scale(0.95); box-shadow: 0 0 0 0 rgba(248,113,113,0.7); }
+            70%  { transform: scale(1);    box-shadow: 0 0 0 10px rgba(248,113,113,0); }
+            100% { transform: scale(0.95); box-shadow: 0 0 0 0 rgba(248,113,113,0); }
+          }
+          .bar-row { display: flex; align-items: center; gap: 0.5rem; margin-top: 0.35rem; }
+          .bar-label { font-size: 0.75rem; color: var(--text-dim); width: 3.5rem; flex-shrink: 0; }
+          .bar-bg { flex: 1; height: 10px; background: #374151; border-radius: 999px; overflow: hidden; }
+          .bar-fill { height: 100%; border-radius: 999px; transition: width 0.4s ease; }
+          .bar-fill.health { background: #f87171; }
+          .bar-fill.food { background: #fb923c; }
+          .bar-num { font-size: 0.75rem; color: var(--text-dim); width: 2.5rem; text-align: right; flex-shrink: 0; }
+          .player-pill {
+            display: inline-block;
+            background: #374151;
+            color: #a3e635;
+            font-size: 0.8rem;
+            padding: 2px 10px;
+            border-radius: 999px;
+            margin: 2px 3px 2px 0;
+          }
+          .chat-box {
+            background: #111827;
+            border-radius: 0.6rem;
+            padding: 0.75rem;
+            max-height: 180px;
+            overflow-y: auto;
+            margin-top: 0.5rem;
+            font-size: 0.8rem;
+            line-height: 1.55;
+          }
+          .chat-box::-webkit-scrollbar { width: 5px; }
+          .chat-box::-webkit-scrollbar-thumb { background: #374151; border-radius: 3px; }
+          .chat-line { margin: 0; color: #cbd5e1; }
+          .chat-line .ts { color: #4b5563; }
+          .chat-line .name { color: var(--accent); font-weight: 600; }
+          .btn {
+            display: inline-flex;
+            align-items: center;
+            justify-content: center;
+            gap: 0.75rem;
+            background: var(--accent);
+            color: #0f172a;
+            padding: 1rem 2rem;
+            border-radius: 1rem;
+            font-weight: 700;
+            text-decoration: none;
+            margin-top: 1.5rem;
+            transition: all 0.2s;
+            box-shadow: 0 0 20px rgba(45,212,191,0.4);
+            width: 100%;
+            box-sizing: border-box;
+          }
+          .btn:hover { transform: translateY(-2px); filter: brightness(1.1); }
+          .footer { margin-top: 1.5rem; font-size: 0.8125rem; color: #4b5563; text-align: center; }
+        </style>
+      </head>
+      <body>
+        <div class="container">
+          <h1>🤖 ${config.name}</h1>
+          <div class="card">
+            <div class="label">Status</div>
+            <div class="value">
+              <span id="status-dot" class="dot pulse"></span>
+              <span id="status-text">Connecting...</span>
+            </div>
+          </div>
+          <div class="card">
+            <div class="label">Uptime</div>
+            <div class="value" id="uptime-text">0h 0m 0s</div>
+          </div>
+          <div class="card">
+            <div class="label">Coordinates</div>
+            <div class="value">📍 <span id="coords-text">Searching...</span></div>
+          </div>
+          <div class="card">
+            <div class="label">Health &amp; Food</div>
+            <div class="bar-row">
+              <span class="bar-label">❤️ Health</span>
+              <div class="bar-bg"><div id="health-bar" class="bar-fill health" style="width:100%"></div></div>
+              <span id="health-num" class="bar-num">20/20</span>
+            </div>
+            <div class="bar-row">
+              <span class="bar-label">🍗 Food</span>
+              <div class="bar-bg"><div id="food-bar" class="bar-fill food" style="width:100%"></div></div>
+              <span id="food-num" class="bar-num">20/20</span>
+            </div>
+          </div>
+          <div class="card">
+            <div class="label">Online Players (<span id="player-count">0</span>)</div>
+            <div class="value" id="players-wrap" style="flex-wrap:wrap; font-size:0.9rem; min-height:1.4rem;">
+              <span style="color:var(--text-dim)">No players yet</span>
+            </div>
+          </div>
+          <div class="card">
+            <div class="label">Server</div>
+            <div class="value" style="font-size:1.1rem; color:#5eead4;">${config.server.ip}</div>
+          </div>
+          <div class="card">
+            <div class="label">Recent Chat</div>
+            <div class="chat-box" id="chat-log">
+              <p class="chat-line" style="color:var(--text-dim)">No messages yet...</p>
+            </div>
+          </div>
+          <a href="/tutorial" class="btn">📘 View Setup Guide</a>
+          <div class="footer">Auto-refreshing every 5s</div>
+        </div>
+        <script>
+          function formatUptime(s) {
+            const h = Math.floor(s/3600), m = Math.floor((s%3600)/60), sec = s%60;
+            return h+'h '+m+'m '+sec+'s';
+          }
+          function escHtml(str) {
+            return String(str).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
+          }
+          async function update() {
+            try {
+              const r = await fetch('/stats');
+              const d = await r.json();
+              const statusText = document.getElementById('status-text');
+              const statusDot = document.getElementById('status-dot');
+              if (d.status === 'connected') {
+                statusText.innerText = 'Online & Running';
+                statusDot.className = 'dot pulse';
+              } else {
+                statusText.innerText = 'Reconnecting...';
+                statusDot.className = 'dot offline pulse';
+              }
+              document.getElementById('uptime-text').innerText = formatUptime(d.uptime);
+              const ct = document.getElementById('coords-text');
+              if (d.coords) {
+                ct.innerText = Math.floor(d.coords.x)+', '+Math.floor(d.coords.y)+', '+Math.floor(d.coords.z);
+              } else {
+                ct.innerText = 'Searching Position...';
+              }
+              const hp = d.health != null ? d.health : 20;
+              const food = d.food != null ? d.food : 20;
+              document.getElementById('health-bar').style.width = (hp/20*100)+'%';
+              document.getElementById('food-bar').style.width = (food/20*100)+'%';
+              document.getElementById('health-num').innerText = Math.round(hp)+'/20';
+              document.getElementById('food-num').innerText = Math.round(food)+'/20';
+              const pw = document.getElementById('players-wrap');
+              document.getElementById('player-count').innerText = d.players ? d.players.length : 0;
+              if (d.players && d.players.length > 0) {
+                pw.innerHTML = d.players.map(p => '<span class="player-pill">'+escHtml(p)+'</span>').join('');
+              } else {
+                pw.innerHTML = '<span style="color:var(--text-dim); font-size:0.85rem;">No players online</span>';
+              }
+              const box = document.getElementById('chat-log');
+              if (d.chatLog && d.chatLog.length > 0) {
+                const last10 = d.chatLog.slice(-10);
+                box.innerHTML = last10.map(m =>
+                  '<p class="chat-line"><span class="ts">['+escHtml(m.time)+']</span> '+
+                  '<span class="name">&lt;'+escHtml(m.username)+'&gt;</span> '+
+                  escHtml(m.message)+'</p>'
+                ).join('');
+                box.scrollTop = box.scrollHeight;
+              } else {
+                box.innerHTML = '<p class="chat-line" style="color:var(--text-dim)">No messages yet...</p>';
+              }
+            } catch(e) {
+              document.getElementById('status-text').innerText = 'System Offline';
+              document.getElementById('status-dot').className = 'dot offline';
+            }
+          }
+          setInterval(update, 5000);
+          update();
+        </script>
+      </body>
+    </html>
+  `);
+});
+
+app.get('/tutorial', (req, res) => {
+  res.send(`
+    <html>
+      <head>
+        <title>${config.name} - Setup Guide</title>
+        <style>
+          body { font-family: 'Segoe UI', sans-serif; background: #0f172a; color: #cbd5e1; padding: 40px; max-width: 800px; margin: 0 auto; line-height: 1.6; }
+          h1, h2 { color: #2dd4bf; }
+          h1 { border-bottom: 2px solid #334155; padding-bottom: 10px; }
+          .card { background: #1e293b; padding: 25px; border-radius: 12px; margin-bottom: 20px; border: 1px solid #334155; }
+          a { color: #38bdf8; text-decoration: none; }
+          code { background: #334155; padding: 2px 6px; border-radius: 4px; color: #e2e8f0; font-family: monospace; }
+          .btn-home { display: inline-block; margin-bottom: 20px; padding: 8px 16px; background: #334155; color: white; border-radius: 6px; text-decoration: none; }
+        </style>
+      </head>
+      <body>
+        <a href="/" class="btn-home">Back to Dashboard</a>
+        <h1>Setup Guide</h1>
+        <div class="card">
+          <h2>Step 1: Aternos</h2>
+          <ol>
+            <li>Install <strong>Paper/Bukkit</strong> software.</li>
+            <li>Enable <strong>Cracked</strong> mode.</li>
+            <li>Install: <code>ViaVersion</code>, <code>ViaBackwards</code>, <code>ViaRewind</code>.</li>
+          </ol>
+        </div>
+        <div class="card">
+          <h2>Step 2: GitHub</h2>
+          <ol>
+            <li>Upload <code>index.js</code>, <code>settings.json</code>, <code>package.json</code> to a new repo.</li>
+          </ol>
+        </div>
+        <div class="card">
+          <h2>Step 3: Render</h2>
+          <ol>
+            <li>Go to <a href="https://render.com" target="_blank">Render.com</a> → New Web Service.</li>
+            <li>Build Command: <code>npm install</code></li>
+            <li>Start Command: <code>node index.js</code></li>
+          </ol>
+        </div>
+      </body>
+    </html>
+  `);
+});
+
+app.get('/health', (req, res) => {
+  res.json({
+    status: botState.connected ? 'connected' : 'disconnected',
+    uptime: Math.floor((Date.now() - botState.startTime) / 1000),
+    coords: (bot && bot.entity) ? bot.entity.position : null,
+    lastActivity: botState.lastActivity,
+    reconnectAttempts: botState.reconnectAttempts,
+    memoryUsage: process.memoryUsage().heapUsed / 1024 / 1024
+  });
+});
+
+app.get('/stats', (req, res) => {
+  const players = (bot && botState.connected && bot.players)
+    ? Object.keys(bot.players).filter(name => name !== bot.username)
+    : [];
+  res.json({
+    status: botState.connected ? 'connected' : 'disconnected',
+    uptime: Math.floor((Date.now() - botState.startTime) / 1000),
+    coords: (bot && bot.entity) ? { x: bot.entity.position.x, y: bot.entity.position.y, z: bot.entity.position.z } : null,
+    health: (bot && botState.connected) ? (bot.health || null) : null,
+    food: (bot && botState.connected) ? (bot.food || null) : null,
+    players: players,
+    reconnectAttempts: botState.reconnectAttempts,
+    chatLog: chatLogBuffer.slice()
+  });
+});
+
+app.get('/ping', (req, res) => res.send('pong'));
+
+const server = app.listen(PORT, '0.0.0.0', () => {
+  console.log(`[Server] HTTP server started on port ${server.address().port}`);
+});
+server.on('error', (err) => {
+  if (err.code === 'EADDRINUSE') {
+    server.listen(PORT + 1, '0.0.0.0');
+  } else {
+    console.log(`[Server] Error: ${err.message}`);
+  }
+});
+
+function formatUptime(seconds) {
+  const h = Math.floor(seconds / 3600);
+  const m = Math.floor((seconds % 3600) / 60);
+  const s = seconds % 60;
+  return `${h}h ${m}m ${s}s`;
+}
+
+const SELF_PING_INTERVAL = 10 * 60 * 1000;
+function startSelfPing() {
+  const renderUrl = process.env.RENDER_EXTERNAL_URL;
+  if (!renderUrl) {
+    console.log('[KeepAlive] No RENDER_EXTERNAL_URL set - self-ping disabled');
+    return;
+  }
+  setInterval(() => {
+    const protocol = renderUrl.startsWith('https') ? https : http;
+    protocol.get(`${renderUrl}/ping`, () => {}).on('error', (err) => {
+      console.log(`[KeepAlive] Self-ping failed: ${err.message}`);
+    });
+  }, SELF_PING_INTERVAL);
+  console.log('[KeepAlive] Self-ping started (every 10 min)');
+}
+startSelfPing();
+
+setInterval(() => {
+  const mem = process.memoryUsage();
+  console.log(`[Memory] Heap: ${(mem.heapUsed / 1024 / 1024).toFixed(2)} MB`);
+}, 5 * 60 * 1000);
+
+let bot = null;
+let activeIntervals = [];
+let reconnectTimeoutId = null;
+let connectionTimeoutId = null;
+let isReconnecting = false;
+let lastDiscordSend = 0;
+const DISCORD_RATE_LIMIT_MS = 5000;
+
+function clearBotTimeouts() {
+  if (reconnectTimeoutId) { clearTimeout(reconnectTimeoutId); reconnectTimeoutId = null; }
+  if (connectionTimeoutId) { clearTimeout(connectionTimeoutId); connectionTimeoutId = null; }
+}
+
+function clearAllIntervals() {
+  activeIntervals.forEach(id => clearInterval(id));
+  activeIntervals = [];
+}
+
+function addInterval(callback, delay) {
+  const id = setInterval(callback, delay);
+  activeIntervals.push(id);
+  return id;
+}
+
+function getReconnectDelay() {
+  if (botState.wasThrottled) {
+    botState.wasThrottled = false;
+    return 60000 + Math.floor(Math.random() * 60000);
+  }
+  const baseDelay = config.utils['auto-reconnect-delay'] || 3000;
+  const maxDelay = config.utils['max-reconnect-delay'] || 30000;
+  const delay = Math.min(baseDelay * Math.pow(2, botState.reconnectAttempts), maxDelay);
+  return delay + Math.floor(Math.random() * 2000);
+}
+
+function createBot() {
+  if (isReconnecting) return;
+  if (bot) {
+    clearAllIntervals();
+    try { bot.removeAllListeners(); bot.end(); } catch (e) {}
+    bot = null;
+  }
+  console.log(`[Bot] Connecting to ${config.server.ip}:${config.server.port}`);
+  try {
+    const botVersion = config.server.version && config.server.version.trim() !== '' ? config.server.version : false;
+    bot = mineflayer.createBot({
+      username: config['bot-account'].username,
+      password: config['bot-account'].password || undefined,
+      auth: config['bot-account'].type,
+      host: config.server.ip,
+      port: config.server.port,
+      version: botVersion,
+      hideErrors: false,
+      checkTimeoutInterval: 600000
+    });
+    bot.loadPlugin(pathfinder);
+    clearBotTimeouts();
+    connectionTimeoutId = setTimeout(() => {
+      if (!botState.connected) {
+        try { bot.removeAllListeners(); bot.end(); } catch (e) {}
+        bot = null;
+        scheduleReconnect();
+      }
+    }, 150000);
+
+    let spawnHandled = false;
+    bot.once('spawn', () => {
+      if (spawnHandled) return;
+      spawnHandled = true;
+      clearBotTimeouts();
+      botState.connected = true;
+      botState.lastActivity = Date.now();
+      botState.reconnectAttempts = 0;
+      isReconnecting = false;
+      console.log(`[Bot] Spawned! (Version: ${bot.version})`);
+      if (config.discord?.events?.connect) sendDiscordWebhook(`[+] **Connected** to \`${config.server.ip}\``, 0x4ade80);
+      const mcData = require('minecraft-data')(bot.version);
+      const defaultMove = new Movements(bot);
+      defaultMove.allowFreeMotion = false;
+      defaultMove.canDig = false;
+      defaultMove.liquidCost = 1000;
+      defaultMove.fallDamageCost = 1000;
+      initializeModules(bot, mcData, defaultMove);
+      setTimeout(() => {
+        if (bot && botState.connected && config.server['try-creative']) bot.chat('/gamemode creative');
+      }, 3000);
+    });
+
+    bot.on('kicked', (reason) => {
+      const kickReason = typeof reason === 'object' ? JSON.stringify(reason) : reason;
+      console.log(`[Bot] Kicked: ${kickReason}`);
+      botState.connected = false;
+      clearAllIntervals();
+      const r = String(kickReason).toLowerCase();
+      if (r.includes('throttl') || r.includes('wait before reconnect') || r.includes('too fast')) {
+        botState.wasThrottled = true;
+      }
+      if (config.discord?.events?.disconnect) sendDiscordWebhook(`[!] **Kicked**: ${kickReason}`, 0xff0000);
+    });
+
+    bot.on('end', (reason) => {
+      console.log(`[Bot] Disconnected: ${reason || 'Unknown'}`);
+      botState.connected = false;
+      clearAllIntervals();
+      spawnHandled = false;
+      if (config.discord?.events?.disconnect) sendDiscordWebhook(`[-] **Disconnected**: ${reason || 'Unknown'}`, 0xf87171);
+      scheduleReconnect();
+    });
+
+    bot.on('error', (err) => {
+      console.log(`[Bot] Error: ${err.message}`);
+    });
+
+  } catch (err) {
+    console.log(`[Bot] Failed to create: ${err.message}`);
+    scheduleReconnect();
+  }
+}
+
+function scheduleReconnect() {
+  clearBotTimeouts();
+  if (isReconnecting) return;
+  isReconnecting = true;
+  botState.reconnectAttempts++;
+  const delay = getReconnectDelay();
+  console.log(`[Bot] Reconnecting in ${delay / 1000}s (attempt #${botState.reconnectAttempts})`);
+  reconnectTimeoutId = setTimeout(() => {
+    reconnectTimeoutId = null;
+    isReconnecting = false;
+    createBot();
+  }, delay);
+}
+
+function initializeModules(bot, mcData, defaultMove) {
+  console.log('[Modules] Initializing...');
+
+  if (config.utils['auto-auth']?.enabled) {
+    const password = config.utils['auto-auth'].password;
+    let authHandled = false;
+    const tryAuth = (type) => {
+      if (authHandled || !bot || !botState.connected) return;
+      authHandled = true;
+      if (type === 'register') {
+        bot.chat(`/register ${password} ${password}`);
+      } else {
+        bot.chat(`/login ${password}`);
+      }
+    };
+    bot.on('messagestr', (message) => {
+      if (authHandled) return;
+      const msg = message.toLowerCase();
+      if (msg.includes('/register') || msg.includes('register ')) tryAuth('register');
+      else if (msg.includes('/login') || msg.includes('login ')) tryAuth('login');
+    });
+    setTimeout(() => {
+      if (!authHandled && bot && botState.connected) {
+        bot.chat(`/login ${password}`);
+        authHandled = true;
+      }
+    }, 10000);
+  }
+
+  if (config.utils['chat-messages']?.enabled) {
+    const messages = config.utils['chat-messages'].messages;
+    if (config.utils['chat-messages'].repeat) {
+      let i = 0;
+      addInterval(() => {
+        if (bot && botState.connected) {
+          bot.chat(messages[i]);
+          botState.lastActivity = Date.now();
+          i = (i + 1) % messages.length;
+        }
+      }, config.utils['chat-messages']['repeat-delay'] * 1000);
+    } else {
+      messages.forEach((msg, idx) => {
+        setTimeout(() => { if (bot && botState.connected) bot.chat(msg); }, idx * 1000);
+      });
+    }
+  }
+
+  if (config.position?.enabled && !(config.movement?.['circle-walk']?.enabled)) {
+    bot.pathfinder.setMovements(defaultMove);
+    bot.pathfinder.setGoal(new GoalBlock(config.position.x, config.position.y, config.position.z));
+  }
+
+  if (config.utils['anti-afk']?.enabled) {
+    addInterval(() => {
+      if (!bot || !botState.connected) return;
+      try { bot.swingArm(); } catch (e) {}
+    }, 10000 + Math.floor(Math.random() * 50000));
+
+    addInterval(() => {
+      if (!bot || !botState.connected) return;
+      try { bot.setQuickBarSlot(Math.floor(Math.random() * 9)); } catch (e) {}
+    }, 30000 + Math.floor(Math.random() * 90000));
+
+    addInterval(() => {
+      if (!bot || !botState.connected || typeof bot.setControlState !== 'function') return;
+      if (Math.random() > 0.9) {
+        let count = 2 + Math.floor(Math.random() * 4);
+        const doTeabag = () => {
+          if (count <= 0 || !bot) return;
+          try {
+            bot.setControlState('sneak', true);
+            setTimeout(() => {
+              if (bot) bot.setControlState('sneak', false);
+              count--;
+              setTimeout(doTeabag, 150);
+            }, 150);
+          } catch (e) {}
+        };
+        doTeabag();
+      }
+    }, 120000 + Math.floor(Math.random() * 180000));
+
+    if (!(config.movement?.['circle-walk']?.enabled)) {
+      addInterval(() => {
+        if (!bot || !botState.connected || typeof bot.setControlState !== 'function') return;
+        try {
+          bot.look(Math.random() * Math.PI * 2, 0, true);
+          bot.setControlState('forward', true);
+          setTimeout(() => { if (bot) bot.setControlState('forward', false); }, 500 + Math.floor(Math.random() * 1500));
+          botState.lastActivity = Date.now();
+        } catch (e) {}
+      }, 120000 + Math.floor(Math.random() * 360000));
+    }
+
+    if (config.utils['anti-afk'].sneak) {
+      try { bot.setControlState('sneak', true); } catch (e) {}
+    }
+  }
+
+  if (config.movement?.enabled !== false) {
+    if (config.movement?.['circle-walk']?.enabled) startCircleWalk(bot, defaultMove);
+    if (config.movement?.['random-jump']?.enabled && !config.movement?.['circle-walk']?.enabled) startRandomJump(bot);
+    if (config.movement?.['look-around']?.enabled) startLookAround(bot);
+  }
+
+  if (config.modules.avoidMobs && !config.modules.combat) avoidMobs(bot);
+  if (config.modules.combat) combatModule(bot, mcData);
+  if (config.modules.beds) bedModule(bot, mcData);
+  if (config.modules.chat) chatModule(bot, mcData, defaultMove);
+
+  adminCommandModule(bot, mcData, defaultMove);
+  playerEventModule(bot);
+  chatLogModule(bot);
+
+  console.log('[Modules] All initialized!');
+}
+
+function startCircleWalk(bot, defaultMove) {
+  const radius = config.movement['circle-walk'].radius;
+  let angle = 0;
+  let lastPathTime = 0;
+  addInterval(() => {
+    if (!bot || !botState.connected) return;
+    const now = Date.now();
+    if (now - lastPathTime < 2000) return;
+    lastPathTime = now;
+    try {
+      const x = bot.entity.position.x + Math.cos(angle) * radius;
+      const z = bot.entity.position.z + Math.sin(angle) * radius;
+      bot.pathfinder.setMovements(defaultMove);
+      bot.pathfinder.setGoal(new GoalBlock(Math.floor(x), Math.floor(bot.entity.position.y), Math.floor(z)));
+      angle += Math.PI / 4;
+      botState.lastActivity = Date.now();
+    } catch (e) {}
+  }, config.movement['circle-walk'].speed);
+}
+
+function startRandomJump(bot) {
+  addInterval(() => {
+    if (!bot || !botState.connected || typeof bot.setControlState !== 'function') return;
+    try {
+      bot.setControlState('jump', true);
+      setTimeout(() => { if (bot) bot.setControlState('jump', false); }, 300);
+      botState.lastActivity = Date.now();
+    } catch (e) {}
+  }, config.movement['random-jump'].interval);
+}
+
+function startLookAround(bot) {
+  addInterval(() => {
+    if (!bot || !botState.connected) return;
+    try {
+      bot.look((Math.random() * Math.PI * 2) - Math.PI, (Math.random() * Math.PI / 2) - Math.PI / 4, false);
+      botState.lastActivity = Date.now();
+    } catch (e) {}
+  }, config.movement['look-around'].interval);
+}
+
+function avoidMobs(bot) {
+  addInterval(() => {
+    if (!bot || !botState.connected || typeof bot.setControlState !== 'function') return;
+    try {
+      const entities = Object.values(bot.entities).filter(e =>
+        e.type === 'mob' || (e.type === 'player' && e.username !== bot.username)
+      );
+      for (const e of entities) {
+        if (!e.position) continue;
+        if (bot.entity.position.distanceTo(e.position) < 5) {
+          bot.setControlState('back', true);
+          setTimeout(() => { if (bot) bot.setControlState('back', false); }, 500);
+          break;
+        }
+      }
+    } catch (e) {}
+  }, 2000);
+}
+
+function combatModule(bot, mcData) {
+  let lastAttackTime = 0;
+  let lockedTarget = null;
+  let lockedTargetExpiry = 0;
+  bot.on('physicsTick', () => {
+    if (!bot || !botState.connected || !config.combat['attack-mobs']) return;
+    const now = Date.now();
+    if (now - lastAttackTime < 620) return;
+    try {
+      if (lockedTarget && now < lockedTargetExpiry && bot.entities[lockedTarget.id] && lockedTarget.position) {
+        if (bot.entity.position.distanceTo(lockedTarget.position) < 4) {
+          bot.attack(lockedTarget);
+          lastAttackTime = now;
+          return;
+        } else { lockedTarget = null; }
+      }
+      const mobs = Object.values(bot.entities).filter(e =>
+        e.type === 'mob' && e.position && bot.entity.position.distanceTo(e.position) < 4
+      );
+      if (mobs.length > 0) {
+        lockedTarget = mobs[0];
+        lockedTargetExpiry = now + 3000;
+        bot.attack(lockedTarget);
+        lastAttackTime = now;
+      }
+    } catch (e) {}
+  });
+  bot.on('health', () => {
+    if (!config.combat['auto-eat']) return;
+    try {
+      if (bot.food < 14) {
+        const food = bot.inventory.items().find(i => i.foodPoints && i.foodPoints > 0);
+        if (food) bot.equip(food, 'hand').then(() => bot.consume()).catch(() => {});
+      }
+    } catch (e) {}
+  });
+}
+
+function bedModule(bot, mcData) {
+  let isTryingToSleep = false;
+  addInterval(async () => {
+    if (!bot || !botState.connected || !config.beds['place-night']) return;
+    try {
+      const isNight = bot.time.timeOfDay >= 12500 && bot.time.timeOfDay <= 23500;
+      if (isNight && !isTryingToSleep) {
+        const bedBlock = bot.findBlock({ matching: block => block.name.includes('bed'), maxDistance: 8 });
+        if (bedBlock) {
+          isTryingToSleep = true;
+          try { await bot.sleep(bedBlock); } catch (e) {} finally { isTryingToSleep = false; }
+        }
+      }
+    } catch (e) { isTryingToSleep = false; }
+  }, 10000);
+}
+
+function chatModule(bot, mcData, defaultMove) {
+  bot.on('chat', (username, message) => {
+    if (!bot || username === bot.username) return;
+    try {
+      if (config.discord?.enabled && config.discord?.events?.chat) {
+        sendDiscordWebhook(`💬 **${username}**: ${message}`, 0x7289da);
+      }
+      if (config.chat?.respond) {
+        const lowerMsg = message.toLowerCase();
+        if (lowerMsg.includes('hello') || lowerMsg.includes('hi')) bot.chat(`Hello, ${username}!`);
+        if (message.startsWith('!tp ')) {
+          const target = message.split(' ')[1];
+          if (target) bot.chat(`/tp ${target}`);
+        }
+      }
+    } catch (e) {}
+  });
+}
+
+function adminCommandModule(bot, mcData, defaultMove) {
+  const admins = Array.isArray(config.admins) ? config.admins.map(a => a.toLowerCase()) : [];
+  if (admins.length === 0) return;
+  console.log(`[AdminCmds] Enabled for: ${config.admins.join(', ')}`);
+  bot.on('chat', (username, message) => {
+    if (!bot || !botState.connected) return;
+    if (!admins.includes(username.toLowerCase())) return;
+    if (!message.startsWith('!')) return;
+    const parts = message.trim().split(/\s+/);
+    const cmd = parts[0].toLowerCase();
+    try {
+      if (cmd === '!pos') {
+        if (bot.entity) {
+          const { x, y, z } = bot.entity.position;
+          bot.chat(`[Bot] X=${Math.floor(x)} Y=${Math.floor(y)} Z=${Math.floor(z)}`);
+        }
+      } else if (cmd === '!uptime') {
+        bot.chat(`[Bot] Uptime: ${formatUptime(Math.floor((Date.now() - botState.startTime) / 1000))}`);
+      } else if (cmd === '!health') {
+        bot.chat(`[Bot] Health: ${Math.round(bot.health || 0)}/20 | Food: ${Math.round(bot.food || 0)}/20`);
+      } else if (cmd === '!follow') {
+        const targetName = parts[1];
+        if (!targetName) { bot.chat('[Bot] Usage: !follow <player>'); return; }
+        const target = bot.players[targetName];
+        if (!target?.entity) { bot.chat(`[Bot] Can't find: ${targetName}`); return; }
+        bot.pathfinder.setMovements(defaultMove);
+        bot.pathfinder.setGoal(new GoalFollow(target.entity, 2), true);
+        bot.chat(`[Bot] Following ${targetName}.`);
+      } else if (cmd === '!stop') {
+        bot.pathfinder.setGoal(null);
+        ['forward','back','left','right','jump','sprint'].forEach(s => {
+          try { bot.setControlState(s, false); } catch(e) {}
+        });
+        bot.chat('[Bot] Stopped.');
+      } else if (cmd === '!say') {
+        const sayMsg = parts.slice(1).join(' ');
+        if (sayMsg) bot.chat(sayMsg);
+      }
+    } catch (e) { console.log('[AdminCmds] Error:', e.message); }
+  });
+}
+
+function playerEventModule(bot) {
+  const playerJoinDiscord = config.discord?.enabled && config.discord?.events?.playerJoin;
+  const greetPlayers = config.chat?.['greet-players'];
+  bot.on('playerJoined', (player) => {
+    if (!player || player.username === bot.username) return;
+    console.log(`[Events] Joined: ${player.username}`);
+    if (playerJoinDiscord) sendDiscordWebhook(`📥 **${player.username}** joined!`, 0x4ade80);
+    if (greetPlayers && botState.connected) {
+      setTimeout(() => { if (bot && botState.connected) bot.chat(`Welcome, ${player.username}!`); }, 1500);
+    }
+  });
+  bot.on('playerLeft', (player) => {
+    if (!player || player.username === bot.username) return;
+    console.log(`[Events] Left: ${player.username}`);
+    if (playerJoinDiscord) sendDiscordWebhook(`📤 **${player.username}** left.`, 0xfbbf24);
+  });
+}
+
+function chatLogModule(bot) {
+  bot.on('chat', (username, message) => {
+    if (!bot) return;
+    appendChatLog(username, message);
+  });
+}
+
+const readline = require('readline');
+const rl = readline.createInterface({ input: process.stdin, output: process.stdout, terminal: false });
+rl.on('line', (line) => {
+  if (!bot || !botState.connected) { console.log('[Console] Bot not connected'); return; }
+  const trimmed = line.trim();
+  if (trimmed.startsWith('say ')) bot.chat(trimmed.slice(4));
+  else if (trimmed.startsWith('cmd ')) bot.chat('/' + trimmed.slice(4));
+  else if (trimmed === 'status') console.log(`Connected: ${botState.connected}, Uptime: ${formatUptime(Math.floor((Date.now() - botState.startTime) / 1000))}`);
+  else bot.chat(trimmed);
+});
+
+function sendDiscordWebhook(content, color = 0x0099ff) {
+  if (!config.discord?.enabled || !config.discord?.webhookUrl || config.discord.webhookUrl.includes('YOUR_DISCORD')) return;
+  const now = Date.now();
+  if (now - lastDiscordSend < DISCORD_RATE_LIMIT_MS) return;
+  lastDiscordSend = now;
+  const protocol = config.discord.webhookUrl.startsWith('https') ? https : http;
+  const urlParts = new URL(config.discord.webhookUrl);
+  const payload = JSON.stringify({
+    username: config.name,
+    embeds: [{ description: content, color, timestamp: new Date().toISOString(), footer: { text: 'AFK Bot' } }]
+  });
+  const req = protocol.request({
+    hostname: urlParts.hostname, port: 443,
+    path: urlParts.pathname + urlParts.search,
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(payload, 'utf8') }
+  }, () => {});
+  req.on('error', (e) => console.log(`[Discord] Error: ${e.message}`));
+  req.write(payload);
+  req.end();
+}
+
+process.on('uncaughtException', (err) => {
+  console.log(`[FATAL] ${err.message}`);
+  clearAllIntervals();
+  botState.connected = false;
+  if (isReconnecting) {
+    isReconnecting = false;
+    if (reconnectTimeoutId) { clearTimeout(reconnectTimeoutId); reconnectTimeoutId = null; }
+  }
+  setTimeout(() => scheduleReconnect(), 10000);
+});
+process.on('unhandledRejection', (reason) => console.log(`[FATAL] Unhandled Rejection: ${reason}`));
+process.on('SIGTERM', () => console.log('[System] SIGTERM ignored.'));
+process.on('SIGINT', () => console.log('[System] SIGINT ignored.'));
+
+console.log('='.repeat(50));
+console.log('  Minecraft AFK Bot v3.0');
+console.log('='.repeat(50));
+console.log(`Server: ${config.server.ip}:${config.server.port}`);
+console.log(`Admins: ${(config.admins || []).join(', ') || 'None'}`);
+console.log('='.repeat(50));
+
+createBot();

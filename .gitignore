@@ -1,0 +1,4 @@
+node_modules/
+chat-log.txt
+.env
+npm-debug.log*
