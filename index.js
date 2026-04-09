@@ -480,6 +480,7 @@ function createBot() {
     clearBotTimeouts();
     connectionTimeoutId = setTimeout(() => {
       if (!botState.connected) {
+        console.log('[Bot] Connection timeout - forcing reconnect');
         try { bot.removeAllListeners(); bot.end(); } catch (e) {}
         bot = null;
         scheduleReconnect();
@@ -503,10 +504,27 @@ function createBot() {
       defaultMove.canDig = false;
       defaultMove.liquidCost = 1000;
       defaultMove.fallDamageCost = 1000;
+
+      // ============================================================
+      // FIX: dismiss any welcome menu/screen by sending blank chat
+      // after spawn - some servers show a menu that blocks the bot
+      // ============================================================
+      setTimeout(() => { try { if (bot && botState.connected) bot.chat(' '); } catch(e) {} }, 1000);
+      setTimeout(() => { try { if (bot && botState.connected) bot.chat(' '); } catch(e) {} }, 3000);
+      setTimeout(() => { try { if (bot && botState.connected) bot.chat(' '); } catch(e) {} }, 6000);
+
       initializeModules(bot, mcData, defaultMove);
       setTimeout(() => {
         if (bot && botState.connected && config.server['try-creative']) bot.chat('/gamemode creative');
       }, 3000);
+    });
+
+    // ============================================================
+    // FIX: log ALL server messages before spawn so we can see
+    // exactly what "Menu" is sending and why bot gets stuck
+    // ============================================================
+    bot.on('messagestr', (message) => {
+      console.log(`[ServerMsg] ${message}`);
     });
 
     bot.on('kicked', (reason) => {
@@ -565,8 +583,10 @@ function initializeModules(bot, mcData, defaultMove) {
       authHandled = true;
       if (type === 'register') {
         bot.chat(`/register ${password} ${password}`);
+        console.log('[Auth] Sent /register');
       } else {
         bot.chat(`/login ${password}`);
+        console.log('[Auth] Sent /login');
       }
     };
     bot.on('messagestr', (message) => {
@@ -577,6 +597,7 @@ function initializeModules(bot, mcData, defaultMove) {
     });
     setTimeout(() => {
       if (!authHandled && bot && botState.connected) {
+        console.log('[Auth] Failsafe - sending /login');
         bot.chat(`/login ${password}`);
         authHandled = true;
       }
